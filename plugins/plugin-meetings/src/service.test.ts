@@ -1038,6 +1038,85 @@ describe("MeetingService — roster, transcripts, listing", () => {
     expect(service.listSessions().map((s) => s.id)).toContain(first.id);
   });
 
+  it("excludes a terminal session from the active list DURING transcript finalization, and keeps its completed record in history", async () => {
+    const adapter = new ScriptedAdapter("google_meet");
+    const { fake, service, pipelines } = makeService([adapter]);
+
+    // Gate the awaited transcript-finalized emit so the test can observe the
+    // window where the session is already terminal ("ended") but not yet
+    // evicted from the live map: finishSession sets the terminal status,
+    // then awaits emitTranscriptFinalized() before deleting the session.
+    let emitGateEntered = false;
+    let releaseEmit: (() => void) | null = null;
+    const originalEmitEvent = fake.runtime.emitEvent;
+    fake.runtime.emitEvent = (async (event, payload) => {
+      if (event === MEETING_TRANSCRIPT_FINALIZED_EVENT) {
+        emitGateEntered = true;
+        await new Promise<void>((resolve) => {
+          releaseEmit = resolve;
+        });
+      }
+      return originalEmitEvent(event, payload);
+    }) as typeof fake.runtime.emitEvent;
+
+    const dto = await service.requestJoin({
+      platform: "google_meet",
+      meetingUrl: MEET_URL,
+    });
+    const botSession = await adapter.started;
+    botSession.sink.participantJoined({ id: "p1", displayName: "Jill" });
+    const s1 = segment("s1", "Jill", "hello world", 0, 2_000);
+    pipelines[0].emit({ confirmed: [s1], pending: [] });
+    pipelines[0].finalSegments = [s1];
+    adapter.report("active");
+
+    // Visibility while active: the session IS in the active list.
+    expect(service.listSessions({ active: true }).map((s) => s.id)).toContain(
+      dto.id,
+    );
+
+    adapter.end("normal_completion");
+    await vi.waitFor(() => expect(emitGateEntered).toBe(true));
+
+    // --- Visibility (active-list) DURING finalization ---
+    // The session is terminal but still in the live map: it must NOT appear
+    // in the active list, while the unfiltered listing and getSession still
+    // read it — visibility is separate from retention.
+    expect(
+      service.listSessions({ active: true }).map((s) => s.id),
+    ).not.toContain(dto.id);
+    expect(service.listSessions().map((s) => s.id)).toContain(dto.id);
+    expect(service.getSession(dto.id as never)?.status).toBe("ended");
+    expect(service.pendingSessionWorkCount()).toBe(1);
+
+    // Let the emit (and therefore eviction) run to completion.
+    releaseEmit?.();
+    const completed = await service.waitForSessionCompletion(dto.id as never);
+
+    // --- Retention (history) AFTER eviction ---
+    expect(completed.status).toBe("ended");
+    expect(completed.endReason).toBe("normal_completion");
+    expect(service.pendingSessionWorkCount()).toBe(0);
+    expect(service.listSessions({ active: true })).toHaveLength(0);
+    // The completed record remains in the full (non-active) listing…
+    expect(service.listSessions().map((s) => s.id)).toContain(dto.id);
+    const kept = service.getSession(dto.id as never);
+    expect(kept?.status).toBe("ended");
+    expect(kept?.transcriptId).toBe(dto.transcriptId);
+    // …and its finalized transcript was persisted before the emit, so the
+    // durable record (transcript + receipt) survives the live-map eviction.
+    const row = fake.memories.get(dto.transcriptId as string);
+    expect(row).toBeTruthy();
+    expect(fake.tables.get(dto.transcriptId as string)).toBe("transcripts");
+    const transcript = row ? readTranscriptRow(row) : null;
+    expect(transcript?.status).toBe("ready");
+    expect(transcript?.segments).toHaveLength(1);
+    const finalizedEvents = fake.events.filter(
+      (e) => e.event === MEETING_TRANSCRIPT_FINALIZED_EVENT,
+    );
+    expect(finalizedEvents).toHaveLength(1);
+  });
+
   it("breaks requestedAt ties deterministically by session id", async () => {
     const fixedNow = 1_700_000_000_000;
     const { restore, setNow, setNextSessionId } = stubClockAndSessionIds();
