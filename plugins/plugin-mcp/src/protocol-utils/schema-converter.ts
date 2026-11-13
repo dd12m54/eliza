@@ -377,6 +377,28 @@ function projectEnumValue(value: unknown): string | number | boolean | null {
   return String(value);
 }
 
+/**
+ * The enforced pinned values a single-type schema can carry into the
+ * generated contract: `const` or fully-pinned `anyOf`/`oneOf` branches.
+ * Only primitive members whose kind matches the projected type ride along:
+ * core rejects constraints beside an untyped `anyOf`, a null member is not a
+ * value of a primitive type, and a non-primitive member has no faithful enum
+ * form. An empty result leaves the schema as it was. A `oneOf` overlap stays
+ * validation's job: the carried set is the union of the branch sets, and a
+ * value two branches pin is rejected by `validateParamsAgainstSchema`.
+ */
+function carriedPinnedValues(
+  values: unknown[],
+  type: RuntimeParameterType
+): Array<string | number | boolean> | undefined {
+  const carried = values.filter(
+    (value): value is string | number | boolean =>
+      (typeof value === "string" || typeof value === "number" || typeof value === "boolean") &&
+      valueRuntimeType(value) === type
+  );
+  return carried.length > 0 ? carried : undefined;
+}
+
 export function convertJsonSchemaToActionParams(
   schema?: McpInputSchema
 ): ActionParameter[] | undefined {
@@ -388,6 +410,14 @@ export function convertJsonSchemaToActionParams(
 
   for (const [name, prop] of Object.entries(properties)) {
     const types = propertyRuntimeTypes(prop);
+    // The enforced pinned set is the effective constraint, so it replaces
+    // the top-level `enum` when one exists; a plain `enum` with no `const`
+    // or pinned branches keeps the previous projection.
+    const pinned = types.length === 1 ? enforcedPinnedValues(prop) : undefined;
+    const enumMembers =
+      pinned !== undefined
+        ? carriedPinnedValues(pinned.values, types[0])
+        : prop.enum?.map(projectEnumValue);
     params.push({
       name,
       description: buildDescription(name, prop),
@@ -398,8 +428,8 @@ export function convertJsonSchemaToActionParams(
           ? {
               type: types[0],
               default: prop.default,
-              enum: prop.enum?.map(projectEnumValue),
-              enumValues: prop.enum?.map(projectEnumValue),
+              enum: enumMembers,
+              enumValues: enumMembers,
             }
           : { anyOf: types.map((type) => ({ type })) },
     });

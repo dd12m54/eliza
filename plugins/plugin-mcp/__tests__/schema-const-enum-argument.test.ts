@@ -82,6 +82,88 @@ describe("const and enum tool arguments without a type", () => {
     expect(params?.[0]?.schema.enum).toBeUndefined();
   });
 
+  it("projects a const-only mode into the generated schema", () => {
+    // A const-only mode used to advertise an unconstrained string: the
+    // pinned value reached inference and validation but not the generated
+    // tool contract. The projection now carries the effective pinned set.
+    const string = convertJsonSchemaToActionParams({
+      properties: { mode: { const: "fast" } },
+    });
+    expect(string?.[0]?.schema.type).toBe("string");
+    expect(string?.[0]?.schema.enum).toEqual(["fast"]);
+    expect(string?.[0]?.schema.enumValues).toEqual(["fast"]);
+
+    const numeric = convertJsonSchemaToActionParams({
+      properties: { version: { const: 1 } },
+    });
+    expect(numeric?.[0]?.schema.type).toBe("number");
+    expect(numeric?.[0]?.schema.enum).toEqual([1]);
+
+    const typed = convertJsonSchemaToActionParams({
+      properties: { mode: { type: "string", const: "fast" } },
+    });
+    expect(typed?.[0]?.schema.enum).toEqual(["fast"]);
+
+    // Same check through the generated core schema, the contract the model
+    // actually sees: the mode no longer advertises an unconstrained string.
+    const generated = actionToJsonSchema({
+      name: "MCP_TEST",
+      description: "test",
+      parameters: convertJsonSchemaToActionParams({
+        properties: { mode: { const: "fast" } },
+      }),
+    } as never);
+    expect(generated.properties.mode).toMatchObject({ type: "string", enum: ["fast"] });
+  });
+
+  it("projects fully-pinned branch sets into the generated schema", () => {
+    const anyOf = actionToJsonSchema({
+      name: "MCP_TEST",
+      description: "test",
+      parameters: convertJsonSchemaToActionParams({
+        properties: { mode: { anyOf: [{ const: "x" }, { const: "y" }] } },
+      }),
+    } as never);
+    expect(anyOf.properties.mode).toMatchObject({ type: "string", enum: ["x", "y"] });
+
+    // A null branch stays validation's job: null is not a value of the
+    // projected string type, so only the string pin rides along.
+    const withNull = convertJsonSchemaToActionParams({
+      properties: { mode: { anyOf: [{ const: "x" }, { type: "null" }] } },
+    });
+    expect(withNull?.[0]?.schema.enum).toEqual(["x"]);
+    expect(
+      validateParamsAgainstSchema(
+        { mode: null },
+        { properties: { mode: { anyOf: [{ const: "x" }, { type: "null" }] } } }
+      )
+    ).toEqual([]);
+
+    const oneOf = actionToJsonSchema({
+      name: "MCP_TEST",
+      description: "test",
+      parameters: convertJsonSchemaToActionParams({
+        properties: { mode: { oneOf: [{ const: "a" }, { const: "b" }] } },
+      }),
+    } as never);
+    expect(oneOf.properties.mode).toMatchObject({ type: "string", enum: ["a", "b"] });
+  });
+
+  it("leaves a const-null parameter and an open union without an enum", () => {
+    // Carrying [null] onto the object fallback would build a schema no
+    // value can satisfy, so a const-null parameter keeps its old shape.
+    const nullConst = convertJsonSchemaToActionParams({
+      properties: { mode: { const: null } },
+    });
+    expect(nullConst?.[0]?.schema.type).toBe("object");
+    expect(nullConst?.[0]?.schema.enum).toBeUndefined();
+
+    const openUnion = convertJsonSchemaToActionParams({
+      properties: { mode: { anyOf: [{ const: "x" }, { type: "string" }] } },
+    });
+    expect(openUnion?.[0]?.schema.enum).toBeUndefined();
+  });
+
   it("accepts the const value and rejects every other value", () => {
     const schema = { properties: { mode: { const: "fast" } }, required: ["mode"] };
     expect(validateParamsAgainstSchema({ mode: "fast" }, schema)).toEqual([]);
